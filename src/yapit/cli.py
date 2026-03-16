@@ -1,7 +1,13 @@
 """Fetch clean markdown from yapit.md documents, URLs, and local files.
 
-Create documents from URLs or local files and download their markdown,
-optionally with TTS annotations.
+Markdown goes to stdout, progress/errors to stderr. Pipe-friendly.
+
+Auth: set YAPIT_EMAIL and YAPIT_PASSWORD (or --email/--password).
+Shared documents can be fetched without auth. Creating documents
+or accessing private docs requires a yapit.md account.
+
+-o saves to <dir>/<slug>/ containing <slug>.md, TTS.md, and images.
+Prints the output path to stdout. Errors if the directory exists.
 
 Examples::
 
@@ -21,6 +27,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from importlib.metadata import version as pkg_version
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlparse
@@ -389,7 +396,7 @@ def save_to_directory(
 class Args:
     """Fetch clean markdown from yapit.md documents, URLs, and local files."""
 
-    input: Annotated[str, tyro.conf.Positional]
+    input: Annotated[str | None, tyro.conf.Positional] = None
     """URL, file path, yapit document UUID, or yapit.md/listen/... link. Use "-" for stdin."""
 
     annotated: bool = False
@@ -416,9 +423,19 @@ class Args:
     password: str = ""
     """Auth password. Env: YAPIT_PASSWORD."""
 
+    version: bool = False
+    """Print version and exit."""
+
 
 def main() -> None:
     args = tyro.cli(Args, description=__doc__)
+
+    if args.version:
+        print(f"yapit {pkg_version('yapit')}")
+        sys.exit(0)
+
+    if not args.input:
+        _die("input is required (URL, file path, UUID, or '-' for stdin)")
 
     base_url = (args.base_url or os.environ.get("YAPIT_BASE_URL", "https://yapit.md")).rstrip("/")
     email = args.email or os.environ.get("YAPIT_EMAIL", "")
