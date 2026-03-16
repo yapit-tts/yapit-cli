@@ -1,15 +1,17 @@
-"""Fetch clean markdown from yapit.md documents and URLs.
+"""Fetch clean markdown from yapit.md documents, URLs, and local files.
 
-Create documents from URLs and download their markdown, optionally with
-TTS annotations. Archive locally with images for Obsidian integration.
+Create documents from URLs or local files and download their markdown,
+optionally with TTS annotations.
 
 Examples::
 
     yapit https://example.com/article
     yapit https://arxiv.org/abs/2301.00001
-    yapit https://yapit.md/listen/550e8400-e29b-41d4-a716-446655440000
+    yapit paper.pdf
+    yapit paper.pdf --ai
     yapit 550e8400-e29b-41d4-a716-446655440000 --annotated
-    yapit https://example.com/article --archive
+    yapit https://yapit.md/listen/550e8400-... -o .
+    echo "hello world" | yapit -
 """
 
 from __future__ import annotations
@@ -47,8 +49,8 @@ def _die(msg: str) -> None:
 # --- Input resolution ---
 
 
-def resolve_input(url_or_id: str) -> tuple[Literal["uuid", "external"], str]:
-    """Detect whether input is a yapit document UUID or an external URL."""
+def resolve_input(url_or_id: str) -> tuple[Literal["uuid", "url", "file", "text"], str]:
+    """Classify input as a yapit document UUID, external URL, local file, or text."""
     if _UUID_RE.match(url_or_id):
         return "uuid", url_or_id
 
@@ -56,11 +58,24 @@ def resolve_input(url_or_id: str) -> tuple[Literal["uuid", "external"], str]:
     if m:
         return "uuid", m.group(1)
 
-    parsed = urlparse(url_or_id)
-    if not parsed.scheme:
-        url_or_id = f"https://{url_or_id}"
+    # Local file?
+    path = Path(url_or_id)
+    if path.exists() and path.is_file():
+        return "file", str(path.resolve())
 
-    return "external", url_or_id
+    # If it has a dot after the first segment, treat as URL
+    parsed = urlparse(url_or_id)
+    if parsed.scheme in ("http", "https"):
+        return "url", url_or_id
+    if "." in url_or_id.split("/")[0]:
+        return "url", f"https://{url_or_id}"
+
+    # Stdin
+    if url_or_id == "-":
+        return "text", sys.stdin.read()
+
+    _die(f"cannot resolve input: {url_or_id!r} (not a UUID, URL, or file path)")
+    raise AssertionError
 
 
 # --- Auth ---
@@ -85,12 +100,17 @@ def authenticate(base_url: str, email: str, password: str) -> str:
     return resp.json()["access_token"]
 
 
+def _require_auth(email: str, password: str, base_url: str) -> str:
+    if not email or not password:
+        _die("authentication required — set YAPIT_EMAIL and YAPIT_PASSWORD")
+    return authenticate(base_url, email, password)
+
+
 # --- Document creation ---
 
 
-def create_document(client: httpx.Client, url: str, ai: bool) -> tuple[str, str | None]:
+def create_from_url(client: httpx.Client, url: str, ai: bool) -> tuple[str, str | None]:
     """Create a document from an external URL. Returns (doc_id, title)."""
-    # Step 1: prepare
     resp = client.post("/v1/documents/prepare", json={"url": url}, timeout=30)
     resp.raise_for_status()
     prep = resp.json()
@@ -102,7 +122,6 @@ def create_document(client: httpx.Client, url: str, ai: bool) -> tuple[str, str 
 
     _err(f"Creating document from {endpoint}...")
 
-    # Step 2: create
     if endpoint == "website":
         resp = client.post("/v1/documents/website", json={"hash": doc_hash}, timeout=60)
         resp.raise_for_status()
@@ -121,19 +140,89 @@ def create_document(client: httpx.Client, url: str, ai: bool) -> tuple[str, str 
             data = resp.json()
             return data["id"], data.get("title") or title
 
-        # 202 — async extraction, need to poll
         extraction = resp.json()
-        extraction_id = extraction.get("extraction_id")
-        total_pages = extraction["total_pages"]
-        pages = list(range(total_pages))
-
-        return _poll_extraction(client, extraction_id, content_hash, ai, pages, title)
-
-    if endpoint == "text":
-        _die("text endpoint not supported for URL creation")
+        return _poll_extraction(
+            client, extraction.get("extraction_id"), content_hash, ai, list(range(extraction["total_pages"])), title
+        )
 
     _die(f"unexpected endpoint type: {endpoint}")
-    raise AssertionError  # unreachable
+    raise AssertionError
+
+
+def create_from_file(client: httpx.Client, file_path: str, ai: bool) -> tuple[str, str | None]:
+    """Create a document from a local file. Returns (doc_id, title)."""
+    path = Path(file_path)
+    content_type = _guess_content_type(path)
+
+    _err(f"Uploading {path.name}...")
+    with path.open("rb") as f:
+        resp = client.post(
+            "/v1/documents/prepare/upload",
+            files={"file": (path.name, f, content_type)},
+            timeout=60,
+        )
+    resp.raise_for_status()
+    prep = resp.json()
+
+    doc_hash = prep["hash"]
+    endpoint = prep["endpoint"]
+    title = prep["metadata"].get("title")
+    content_hash = prep["content_hash"]
+
+    _err(f"Creating document from {endpoint}...")
+
+    if endpoint == "document":
+        resp = client.post(
+            "/v1/documents/document",
+            json={"hash": doc_hash, "ai_transform": ai, "batch_mode": False},
+            timeout=60,
+        )
+        resp.raise_for_status()
+
+        if resp.status_code == 201:
+            data = resp.json()
+            return data["id"], data.get("title") or title
+
+        extraction = resp.json()
+        return _poll_extraction(
+            client, extraction.get("extraction_id"), content_hash, ai, list(range(extraction["total_pages"])), title
+        )
+
+    if endpoint == "text":
+        content = path.read_text(encoding="utf-8")
+        return _create_text(client, content, title=path.stem)
+
+    _die(f"unexpected endpoint type for file: {endpoint}")
+    raise AssertionError
+
+
+def _create_text(client: httpx.Client, content: str, title: str | None = None) -> tuple[str, str | None]:
+    """Create a document from plain text/markdown. Returns (doc_id, title)."""
+    resp = client.post(
+        "/v1/documents/text",
+        json={"content": content, "title": title},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["id"], data.get("title") or title
+
+
+def _guess_content_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    return {
+        ".pdf": "application/pdf",
+        ".html": "text/html",
+        ".htm": "text/html",
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+        ".markdown": "text/markdown",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }.get(suffix, "application/octet-stream")
 
 
 def _poll_extraction(
@@ -200,11 +289,9 @@ def fetch_markdown(base_url: str, doc_id: str, annotated: bool, token: str | Non
 
 def fetch_title(base_url: str, doc_id: str, token: str | None) -> str | None:
     """Fetch document title from the API."""
-    # /public endpoint always works for shared docs, no auth needed
     resp = httpx.get(f"{base_url}/api/v1/documents/{doc_id}/public", timeout=15)
     if resp.status_code == 200:
         return resp.json().get("title")
-    # Private doc — need auth
     if token:
         resp = httpx.get(
             f"{base_url}/api/v1/documents/{doc_id}",
@@ -216,36 +303,18 @@ def fetch_title(base_url: str, doc_id: str, token: str | None) -> str | None:
     return None
 
 
-# --- Archive ---
-
-
-def archive_document(
-    markdown: str,
-    annotated_md: str | None,
-    title: str | None,
-    base_url: str,
-    archive_dir: Path,
-) -> Path:
-    """Save markdown and images to archive directory. Returns the archive path."""
-    slug = _slugify(title or "untitled")
-    doc_dir = archive_dir / slug
-    doc_dir.mkdir(parents=True, exist_ok=True)
-
-    # Download images and rewrite paths
-    markdown = _download_images(markdown, base_url, doc_dir)
-    if annotated_md:
-        annotated_md = _download_images(annotated_md, base_url, doc_dir)
-
-    (doc_dir / f"{slug}.md").write_text(markdown, encoding="utf-8")
-    if annotated_md:
-        (doc_dir / "TTS.md").write_text(annotated_md, encoding="utf-8")
-
-    return doc_dir
+# --- Save to directory ---
 
 
 def _slugify(title: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", title).strip("-").lower()
     return slug[:100] or "untitled"
+
+
+def _title_from_markdown(md: str) -> str | None:
+    """Extract title from first # heading as fallback."""
+    m = re.search(r"^#\s+(.+)$", md, re.MULTILINE)
+    return m.group(1).strip() if m else None
 
 
 def _download_images(markdown: str, base_url: str, doc_dir: Path) -> str:
@@ -258,11 +327,9 @@ def _download_images(markdown: str, base_url: str, doc_dir: Path) -> str:
         if url in seen:
             return f"![{alt}]({seen[url]})"
 
-        # Skip data URIs
         if url.startswith("data:"):
             return match.group(0)
 
-        # Resolve relative URLs (e.g. /images/hash/file.png)
         if url.startswith("/"):
             full_url = f"{base_url}{url}"
         elif not url.startswith(("http://", "https://")):
@@ -270,7 +337,6 @@ def _download_images(markdown: str, base_url: str, doc_dir: Path) -> str:
         else:
             full_url = url
 
-        # Strip query params for filename
         parsed = urlparse(full_url)
         filename = Path(parsed.path).name
         if not filename:
@@ -290,27 +356,59 @@ def _download_images(markdown: str, base_url: str, doc_dir: Path) -> str:
     return _IMAGE_RE.sub(replace_image, markdown)
 
 
+def save_to_directory(
+    md: str,
+    annotated_md: str | None,
+    title: str | None,
+    base_url: str,
+    output_dir: Path,
+    download_images: bool = True,
+) -> Path:
+    """Save markdown, annotated version, and images to a directory. Returns the path."""
+    slug = _slugify(title or "untitled")
+    doc_dir = output_dir / slug
+
+    if doc_dir.exists():
+        _die(f"output directory already exists: {doc_dir}")
+
+    doc_dir.mkdir(parents=True)
+
+    if download_images:
+        md = _download_images(md, base_url, doc_dir)
+        if annotated_md:
+            annotated_md = _download_images(annotated_md, base_url, doc_dir)
+
+    (doc_dir / f"{slug}.md").write_text(md, encoding="utf-8")
+    if annotated_md:
+        (doc_dir / "TTS.md").write_text(annotated_md, encoding="utf-8")
+
+    return doc_dir
+
+
 # --- CLI ---
 
 
 @dataclass
 class Args:
-    """Fetch clean markdown from yapit.md documents and URLs."""
+    """Fetch clean markdown from yapit.md documents, URLs, and local files."""
 
-    url: Annotated[str, tyro.conf.Positional]
-    """URL, yapit document UUID, or yapit.md/listen/... link."""
+    input: Annotated[str, tyro.conf.Positional]
+    """URL, file path, yapit document UUID, or yapit.md/listen/... link. Use "-" for stdin."""
 
     annotated: bool = False
     """Include TTS annotations (yap-speak, yap-show, yap-cap tags)."""
 
-    archive: bool = False
-    """Save to archive directory with images instead of printing to stdout."""
+    output_dir: Annotated[str | None, tyro.conf.arg(aliases=["-o"])] = None
+    """Save markdown, TTS annotations, and images to <output-dir>/<slug>/. Prints path to stdout."""
 
-    archive_dir: str = ""
-    """Base directory for archived documents. Default: ~/Documents/archive/papers. Env: YAPIT_ARCHIVE_DIR."""
+    images: bool = True
+    """With -o: download images. Use --no-images to skip."""
+
+    tts: bool = True
+    """With -o: save TTS.md (annotated version). Use --no-tts to skip."""
 
     ai: bool = False
-    """Use AI extraction for PDFs (uses quota, better quality for complex layouts)."""
+    """Use AI extraction for PDFs (uses quota). Produces TTS annotations and handles complex layouts, math, figures."""
 
     base_url: str = ""
     """Yapit instance URL. Default: https://yapit.md. Env: YAPIT_BASE_URL."""
@@ -328,42 +426,49 @@ def main() -> None:
     base_url = (args.base_url or os.environ.get("YAPIT_BASE_URL", "https://yapit.md")).rstrip("/")
     email = args.email or os.environ.get("YAPIT_EMAIL", "")
     password = args.password or os.environ.get("YAPIT_PASSWORD", "")
-    archive_dir = Path(
-        args.archive_dir or os.environ.get("YAPIT_ARCHIVE_DIR", "~/Documents/archive/papers")
-    ).expanduser()
 
-    input_type, value = resolve_input(args.url)
+    input_type, value = resolve_input(args.input)
     token: str | None = None
 
-    # Authenticate if needed
-    needs_auth = input_type == "external" or (email and password)
-    if needs_auth:
-        if not email or not password:
-            _die("authentication required — set YAPIT_EMAIL and YAPIT_PASSWORD")
-        token = authenticate(base_url, email, password)
-
-    # Create document if external URL
     doc_id: str
     title: str | None = None
-    if input_type == "external":
-        assert token is not None
-        client = httpx.Client(
-            base_url=f"{base_url}/api",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30,
-        )
-        doc_id, title = create_document(client, value, ai=args.ai)
-        _err(f"Document created: {base_url}/listen/{doc_id}")
-    else:
-        doc_id = value
 
-    # Fetch markdown
-    if args.archive:
+    if input_type == "uuid":
+        doc_id = value
+        if email and password:
+            token = authenticate(base_url, email, password)
+
+    elif input_type == "url":
+        token = _require_auth(email, password, base_url)
+        client = httpx.Client(base_url=f"{base_url}/api", headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        doc_id, title = create_from_url(client, value, ai=args.ai)
+        _err(f"Document created: {base_url}/listen/{doc_id}")
+
+    elif input_type == "file":
+        token = _require_auth(email, password, base_url)
+        client = httpx.Client(base_url=f"{base_url}/api", headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        doc_id, title = create_from_file(client, value, ai=args.ai)
+        _err(f"Document created: {base_url}/listen/{doc_id}")
+
+    elif input_type == "text":
+        token = _require_auth(email, password, base_url)
+        client = httpx.Client(base_url=f"{base_url}/api", headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        doc_id, title = _create_text(client, value)
+        _err(f"Document created: {base_url}/listen/{doc_id}")
+
+    else:
+        raise AssertionError(f"unexpected input type: {input_type}")
+
+    if args.output_dir is not None:
         if not title:
             title = fetch_title(base_url, doc_id, token)
         md = fetch_markdown(base_url, doc_id, annotated=False, token=token)
-        annotated_md = fetch_markdown(base_url, doc_id, annotated=True, token=token)
-        doc_dir = archive_document(md, annotated_md, title, base_url, archive_dir)
+        if not title:
+            title = _title_from_markdown(md)
+        annotated_md = None if not args.tts else fetch_markdown(base_url, doc_id, annotated=True, token=token)
+        doc_dir = save_to_directory(
+            md, annotated_md, title, base_url, Path(args.output_dir), download_images=args.images
+        )
         print(doc_dir)
     else:
         md = fetch_markdown(base_url, doc_id, annotated=args.annotated, token=token)
