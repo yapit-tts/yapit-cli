@@ -236,6 +236,7 @@ def _poll_extraction(
     """Poll extraction status until complete. Returns (doc_id, title)."""
     interval = 0.5
     max_interval = 3.0
+    last_completed = -1
 
     while True:
         resp = client.post(
@@ -263,7 +264,9 @@ def _poll_extraction(
             _err(f"Extracted {total}/{total} pages")
             return doc_id, title
 
-        _err(f"Extracting... {completed}/{total} pages")
+        if completed != last_completed:
+            _err(f"Extracting... {completed}/{total} pages")
+            last_completed = completed
         time.sleep(interval)
         interval = min(interval * 1.5, max_interval)
 
@@ -289,17 +292,11 @@ def fetch_markdown(base_url: str, doc_id: str, annotated: bool, token: str | Non
 
 def fetch_title(base_url: str, doc_id: str, token: str | None) -> str | None:
     """Fetch document title from the API."""
-    resp = httpx.get(f"{base_url}/api/v1/documents/{doc_id}/public", timeout=15)
+    url = f"{base_url}/api/v1/documents/{doc_id}"
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    resp = httpx.get(url, headers=headers, timeout=15)
     if resp.status_code == 200:
         return resp.json().get("title")
-    if token:
-        resp = httpx.get(
-            f"{base_url}/api/v1/documents/{doc_id}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            return resp.json().get("title")
     return None
 
 
