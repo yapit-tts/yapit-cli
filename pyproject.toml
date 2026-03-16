@@ -1,0 +1,44 @@
+[project]
+name = "yapit"
+version = "0.1.0"
+description = "CLI for yapit.md — fetch clean markdown from URLs and documents"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "AGPL-3.0-only"
+authors = [{ name = "Maximilian Wolf", email = "max@mwolf.dev" }]
+keywords = ["cli", "tts", "markdown", "document-extraction", "yapit"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Text Processing :: Markup :: Markdown",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "tyro>=1.0.9",
+    "httpx>=0.28.1",
+]
+
+[project.urls]
+Repository = "https://github.com/yapit-tts/yapit-cli"
+Issues = "https://github.com/yapit-tts/yapit-cli/issues"
+Homepage = "https://yapit.md"
+
+[project.scripts]
+yapit = "yapit:main"
+
+[build-system]
+requires = ["uv_build>=0.10.10,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.6",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP", "SIM"]
+ignore = ["E501", "SIM108"]
