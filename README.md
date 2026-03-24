@@ -50,9 +50,9 @@ Fetching shared documents works without auth.
 
 ```
 <dir>/<slug>/
-  <slug>.md     # clean markdown, image paths rewritten to relative
-  TTS.md        # annotated version (yap-speak, yap-show tags)
-  *.png         # extracted images
+  <slug>.md       # clean markdown, image paths rewritten to relative
+  TTS.md          # annotated version (yap-speak, yap-show tags)
+  <slug>-<N>.png  # images renamed sequentially
 ```
 
 Errors if the output directory already exists.

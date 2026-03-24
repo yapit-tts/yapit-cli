@@ -6,7 +6,8 @@ Auth: set YAPIT_EMAIL and YAPIT_PASSWORD (or --email/--password).
 Shared documents can be fetched without auth. Creating documents
 or accessing private docs requires a yapit.md account.
 
--o saves to <dir>/<slug>/ containing <slug>.md, TTS.md, and images.
+-o saves to <dir>/<slug>/ containing <slug>.md, TTS.md, and images
+(renamed to <slug>-1.png, <slug>-2.png, ...).
 Prints the output path to stdout. Errors if the directory exists.
 
 Examples::
@@ -22,10 +23,12 @@ Examples::
 
 from __future__ import annotations
 
+import itertools
 import os
 import re
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from importlib.metadata import version as pkg_version
 from pathlib import Path
@@ -321,43 +324,55 @@ def _title_from_markdown(md: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
-def _download_images(markdown: str, base_url: str, doc_dir: Path) -> str:
-    """Download images referenced in markdown, rewrite URLs to relative paths."""
+def _make_image_downloader(slug: str, base_url: str, doc_dir: Path) -> Callable[[str], str]:
+    """Create a reusable image downloader that renames images to <slug>-<N>.<ext>.
+
+    Returns a function that processes markdown, downloading and renaming images.
+    State (counter, seen URLs) is shared across calls so the same image gets the
+    same filename when referenced in both the main and annotated markdown.
+    """
     seen: dict[str, str] = {}
+    counter = itertools.count(1)
 
-    def replace_image(match: re.Match) -> str:
-        alt, url = match.group(1), match.group(2)
+    def download_images(markdown: str) -> str:
+        def replace_image(match: re.Match) -> str:
+            alt, url = match.group(1), match.group(2)
 
-        if url in seen:
-            return f"![{alt}]({seen[url]})"
+            if url in seen:
+                return f"![{alt}]({seen[url]})"
 
-        if url.startswith("data:"):
-            return match.group(0)
+            if url.startswith("data:"):
+                return match.group(0)
 
-        if url.startswith("/"):
-            full_url = f"{base_url}{url}"
-        elif not url.startswith(("http://", "https://")):
-            return match.group(0)
-        else:
-            full_url = url
+            if url.startswith("/"):
+                full_url = f"{base_url}{url}"
+            elif not url.startswith(("http://", "https://")):
+                return match.group(0)
+            else:
+                full_url = url
 
-        parsed = urlparse(full_url)
-        filename = Path(parsed.path).name
-        if not filename:
-            return match.group(0)
+            parsed = urlparse(full_url)
+            orig_name = Path(parsed.path).name
+            if not orig_name:
+                return match.group(0)
 
-        try:
-            resp = httpx.get(full_url, timeout=15, follow_redirects=True)
-            resp.raise_for_status()
-            (doc_dir / filename).write_bytes(resp.content)
-            relative = f"./{filename}"
-            seen[url] = relative
-            return f"![{alt}]({relative})"
-        except httpx.HTTPError:
-            _err(f"warning: failed to download image {full_url}")
-            return match.group(0)
+            ext = Path(orig_name).suffix or ".png"
+            filename = f"{slug}-{next(counter)}{ext}"
 
-    return _IMAGE_RE.sub(replace_image, markdown)
+            try:
+                resp = httpx.get(full_url, timeout=15, follow_redirects=True)
+                resp.raise_for_status()
+                (doc_dir / filename).write_bytes(resp.content)
+                relative = f"./{filename}"
+                seen[url] = relative
+                return f"![{alt}]({relative})"
+            except httpx.HTTPError:
+                _err(f"warning: failed to download image {full_url}")
+                return match.group(0)
+
+        return _IMAGE_RE.sub(replace_image, markdown)
+
+    return download_images
 
 
 def save_to_directory(
@@ -378,9 +393,10 @@ def save_to_directory(
     doc_dir.mkdir(parents=True)
 
     if download_images:
-        md = _download_images(md, base_url, doc_dir)
+        dl = _make_image_downloader(slug, base_url, doc_dir)
+        md = dl(md)
         if annotated_md:
-            annotated_md = _download_images(annotated_md, base_url, doc_dir)
+            annotated_md = dl(annotated_md)
 
     (doc_dir / f"{slug}.md").write_text(md, encoding="utf-8")
     if annotated_md:
