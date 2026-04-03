@@ -375,12 +375,26 @@ def _make_image_downloader(slug: str, base_url: str, doc_dir: Path) -> Callable[
     return download_images
 
 
+def _yaml_frontmatter(title: str | None, source_url: str | None) -> str:
+    """Build YAML frontmatter string. Returns empty string if no metadata."""
+    fields: list[str] = []
+    if title:
+        escaped = title.replace('"', '\\"')
+        fields.append(f'title: "{escaped}"')
+    if source_url:
+        fields.append(f"source: {source_url}")
+    if not fields:
+        return ""
+    return "---\n" + "\n".join(fields) + "\n---\n\n"
+
+
 def save_to_directory(
     md: str,
     annotated_md: str | None,
     title: str | None,
     base_url: str,
     output_dir: Path,
+    source_url: str | None = None,
     download_images: bool = True,
 ) -> Path:
     """Save markdown, annotated version, and images to a directory. Returns the path."""
@@ -398,7 +412,8 @@ def save_to_directory(
         if annotated_md:
             annotated_md = dl(annotated_md)
 
-    (doc_dir / f"{slug}.md").write_text(md, encoding="utf-8")
+    frontmatter = _yaml_frontmatter(title, source_url)
+    (doc_dir / f"{slug}.md").write_text(frontmatter + md, encoding="utf-8")
     if annotated_md:
         (doc_dir / "TTS.md").write_text(annotated_md, encoding="utf-8")
 
@@ -462,6 +477,7 @@ def main() -> None:
 
     doc_id: str
     title: str | None = None
+    source_url: str | None = None
 
     if input_type == "uuid":
         doc_id = value
@@ -472,6 +488,7 @@ def main() -> None:
         token = _require_auth(email, password, base_url)
         client = httpx.Client(base_url=f"{base_url}/api", headers={"Authorization": f"Bearer {token}"}, timeout=30)
         doc_id, title = create_from_url(client, value, ai=args.ai)
+        source_url = value
         _err(f"Document created: {base_url}/listen/{doc_id}")
 
     elif input_type == "file":
@@ -497,7 +514,8 @@ def main() -> None:
             title = _title_from_markdown(md)
         annotated_md = None if not args.tts else fetch_markdown(base_url, doc_id, annotated=True, token=token)
         doc_dir = save_to_directory(
-            md, annotated_md, title, base_url, Path(args.output_dir), download_images=args.images
+            md, annotated_md, title, base_url, Path(args.output_dir),
+            source_url=source_url, download_images=args.images,
         )
         print(doc_dir)
     else:
