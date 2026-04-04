@@ -318,12 +318,6 @@ def _slugify(title: str) -> str:
     return slug[:100] or "untitled"
 
 
-def _title_from_markdown(md: str) -> str | None:
-    """Extract title from first # heading as fallback."""
-    m = re.search(r"^#\s+(.+)$", md, re.MULTILINE)
-    return m.group(1).strip() if m else None
-
-
 def _make_image_downloader(slug: str, base_url: str, doc_dir: Path) -> Callable[[str], str]:
     """Create a reusable image downloader that renames images to <slug>-<N>.<ext>.
 
@@ -481,6 +475,7 @@ def main() -> None:
 
     if input_type == "uuid":
         doc_id = value
+        source_url = f"{base_url}/listen/{value}"
         if email and password:
             token = authenticate(base_url, email, password)
 
@@ -506,12 +501,11 @@ def main() -> None:
     else:
         raise AssertionError(f"unexpected input type: {input_type}")
 
+    if not title:
+        title = fetch_title(base_url, doc_id, token)
+    md = fetch_markdown(base_url, doc_id, annotated=False, token=token)
+
     if args.output_dir is not None:
-        if not title:
-            title = fetch_title(base_url, doc_id, token)
-        md = fetch_markdown(base_url, doc_id, annotated=False, token=token)
-        if not title:
-            title = _title_from_markdown(md)
         annotated_md = None if not args.tts else fetch_markdown(base_url, doc_id, annotated=True, token=token)
         doc_dir = save_to_directory(
             md, annotated_md, title, base_url, Path(args.output_dir),
@@ -519,5 +513,7 @@ def main() -> None:
         )
         print(doc_dir)
     else:
-        md = fetch_markdown(base_url, doc_id, annotated=args.annotated, token=token)
-        print(md)
+        if args.annotated:
+            md = fetch_markdown(base_url, doc_id, annotated=True, token=token)
+        frontmatter = _yaml_frontmatter(title, source_url)
+        print(frontmatter + md, end="" if md.endswith("\n") else "\n")
