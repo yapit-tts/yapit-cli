@@ -300,14 +300,17 @@ def fetch_markdown(base_url: str, doc_id: str, annotated: bool, token: str | Non
     raise AssertionError  # unreachable
 
 
-def fetch_title(base_url: str, doc_id: str, token: str | None) -> str | None:
-    """Fetch document title from the API."""
+def fetch_document_metadata(base_url: str, doc_id: str, token: str | None) -> tuple[str | None, str | None]:
+    """Fetch document title and source URL from the API."""
     url = f"{base_url}/api/v1/documents/{doc_id}"
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     resp = httpx.get(url, headers=headers, timeout=15)
     if resp.status_code == 200:
-        return resp.json().get("title")
-    return None
+        data = resp.json()
+        title = data.get("title")
+        source_url = (data.get("metadata_dict") or {}).get("url")
+        return title, source_url
+    return None, None
 
 
 # --- Save to directory ---
@@ -475,7 +478,6 @@ def main() -> None:
 
     if input_type == "uuid":
         doc_id = value
-        source_url = f"{base_url}/listen/{value}"
         if email and password:
             token = authenticate(base_url, email, password)
 
@@ -501,8 +503,12 @@ def main() -> None:
     else:
         raise AssertionError(f"unexpected input type: {input_type}")
 
-    if not title:
-        title = fetch_title(base_url, doc_id, token)
+    if not title or not source_url:
+        api_title, api_source_url = fetch_document_metadata(base_url, doc_id, token)
+        if not title:
+            title = api_title
+        if not source_url:
+            source_url = api_source_url
     md = fetch_markdown(base_url, doc_id, annotated=False, token=token)
 
     if args.output_dir is not None:
