@@ -1,6 +1,6 @@
 [project]
 name = "yapit"
-version = "0.2.5"
+version = "0.3.0"
 description = "CLI for yapit.md — fetch clean markdown from URLs and documents"
 readme = "README.md"
 requires-python = ">=3.14"
