@@ -1,29 +1,21 @@
 """Fetch clean markdown from yapit.md documents, URLs, and local files.
 
-Markdown goes to stdout, progress/errors to stderr. Pipe-friendly.
-
 Auth: set YAPIT_EMAIL and YAPIT_PASSWORD (or --email/--password).
 Shared documents can be fetched without auth. Creating documents
 or accessing private docs requires a yapit.md account.
 
--o saves to <dir>/<slug>/ containing <slug>.md, TTS.md, and images
-(renamed to <slug>-1.png, <slug>-2.png, ...).
-Prints the output path to stdout. Errors if the directory exists.
+Examples:
 
-Examples::
-
-    yapit https://example.com/article
-    yapit https://arxiv.org/abs/2301.00001
-    yapit paper.pdf
-    yapit paper.pdf --ai
-    yapit 550e8400-e29b-41d4-a716-446655440000 --annotated
-    yapit https://yapit.md/listen/550e8400-... -o .
-    echo "hello world" | yapit -
+    yapit fetch https://example.com/article
+    yapit fetch paper.pdf --ai -o .
+    yapit list
+    yapit list --json | jq '.[].title'
 """
 
 from __future__ import annotations
 
 import itertools
+import json as json_mod
 import os
 import re
 import sys
@@ -37,6 +29,7 @@ from urllib.parse import urlparse
 
 import httpx
 import tyro
+from tyro.extras import SubcommandApp
 
 # Stack Auth public credentials (baked into the frontend bundle)
 _STACK_PROJECT_ID = "6038930b-72c1-407f-9e38-f1287a4d1ede"
@@ -45,6 +38,8 @@ _STACK_CLIENT_KEY = "pck_m04c3bgjsmstpk4khbhtma5161b694zcrk94v6dcavpbr"
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 _YAPIT_LISTEN_RE = re.compile(r"yapit\.md/listen/([0-9a-f-]{36})", re.IGNORECASE)
 _IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+
+app = SubcommandApp()
 
 
 def _err(msg: str) -> None:
@@ -56,39 +51,15 @@ def _die(msg: str) -> None:
     sys.exit(1)
 
 
-# --- Input resolution ---
-
-
-def resolve_input(url_or_id: str) -> tuple[Literal["uuid", "url", "file", "text"], str]:
-    """Classify input as a yapit document UUID, external URL, local file, or text."""
-    if _UUID_RE.match(url_or_id):
-        return "uuid", url_or_id
-
-    m = _YAPIT_LISTEN_RE.search(url_or_id)
-    if m:
-        return "uuid", m.group(1)
-
-    # Local file?
-    path = Path(url_or_id)
-    if path.exists() and path.is_file():
-        return "file", str(path.resolve())
-
-    # If it has a dot after the first segment, treat as URL
-    parsed = urlparse(url_or_id)
-    if parsed.scheme in ("http", "https"):
-        return "url", url_or_id
-    if "." in url_or_id.split("/")[0]:
-        return "url", f"https://{url_or_id}"
-
-    # Stdin
-    if url_or_id == "-":
-        return "text", sys.stdin.read()
-
-    _die(f"cannot resolve input: {url_or_id!r} (not a UUID, URL, or file path)")
-    raise AssertionError
-
-
 # --- Auth ---
+
+
+def _resolve_auth(email: str, password: str, base_url: str) -> tuple[str, str, str]:
+    """Resolve auth and base_url from args/env, return (base_url, email, password)."""
+    base_url = (base_url or os.environ.get("YAPIT_BASE_URL", "https://yapit.md")).rstrip("/")
+    email = email or os.environ.get("YAPIT_EMAIL", "")
+    password = password or os.environ.get("YAPIT_PASSWORD", "")
+    return base_url, email, password
 
 
 def authenticate(base_url: str, email: str, password: str) -> str:
@@ -114,6 +85,35 @@ def _require_auth(email: str, password: str, base_url: str) -> str:
     if not email or not password:
         _die("authentication required — set YAPIT_EMAIL and YAPIT_PASSWORD")
     return authenticate(base_url, email, password)
+
+
+# --- Input resolution ---
+
+
+def resolve_input(url_or_id: str) -> tuple[Literal["uuid", "url", "file", "text"], str]:
+    """Classify input as a yapit document UUID, external URL, local file, or text."""
+    if _UUID_RE.match(url_or_id):
+        return "uuid", url_or_id
+
+    m = _YAPIT_LISTEN_RE.search(url_or_id)
+    if m:
+        return "uuid", m.group(1)
+
+    path = Path(url_or_id)
+    if path.exists() and path.is_file():
+        return "file", str(path.resolve())
+
+    parsed = urlparse(url_or_id)
+    if parsed.scheme in ("http", "https"):
+        return "url", url_or_id
+    if "." in url_or_id.split("/")[0]:
+        return "url", f"https://{url_or_id}"
+
+    if url_or_id == "-":
+        return "text", sys.stdin.read()
+
+    _die(f"cannot resolve input: {url_or_id!r} (not a UUID, URL, or file path)")
+    raise AssertionError
 
 
 # --- Document creation ---
@@ -417,21 +417,34 @@ def save_to_directory(
     return doc_dir
 
 
-# --- CLI ---
+# --- Commands ---
 
 
 @dataclass
-class Args:
-    """Fetch clean markdown from yapit.md documents, URLs, and local files."""
+class FetchArgs:
+    """Fetch clean markdown from a URL, file, UUID, or stdin.
 
-    input: Annotated[str | None, tyro.conf.Positional] = None
+    Markdown goes to stdout, progress/errors to stderr. Pipe-friendly.
+
+    -o saves to <dir>/<slug>/ containing <slug>.md, TTS.md, and images.
+    Prints the output path to stdout. Errors if the directory exists.
+
+    Examples:
+
+        yapit fetch https://example.com/article
+        yapit fetch paper.pdf --ai -o .
+        yapit fetch 550e8400-e29b-41d4-a716-446655440000 --annotated
+        echo "hello world" | yapit fetch -
+    """
+
+    input: Annotated[str, tyro.conf.Positional]
     """URL, file path, yapit document UUID, or yapit.md/listen/... link. Use "-" for stdin."""
 
     annotated: bool = False
     """Include TTS annotations (yap-speak, yap-show, yap-cap tags)."""
 
     output_dir: Annotated[str | None, tyro.conf.arg(aliases=["-o"])] = None
-    """Save markdown, TTS annotations, and images to <output-dir>/<slug>/. Prints path to stdout."""
+    """Save markdown, TTS annotations, and images to <output-dir>/<slug>/."""
 
     images: bool = True
     """With -o: download images. Use --no-images to skip."""
@@ -440,7 +453,7 @@ class Args:
     """With -o: save TTS.md (annotated version). Use --no-tts to skip."""
 
     ai: bool = False
-    """Use AI extraction for PDFs (uses quota). Produces TTS annotations and handles complex layouts, math, figures."""
+    """Use AI extraction for PDFs (uses quota)."""
 
     base_url: str = ""
     """Yapit instance URL. Default: https://yapit.md. Env: YAPIT_BASE_URL."""
@@ -451,28 +464,15 @@ class Args:
     password: str = ""
     """Auth password. Env: YAPIT_PASSWORD."""
 
-    version: bool = False
-    """Print version and exit."""
 
-
-def main() -> None:
-    args = tyro.cli(Args, description=__doc__)
-
-    if args.version:
-        print(f"yapit {pkg_version('yapit')}")
-        sys.exit(0)
-
-    if not args.input:
-        _die("input is required (URL, file path, UUID, or '-' for stdin)")
-
-    base_url = (args.base_url or os.environ.get("YAPIT_BASE_URL", "https://yapit.md")).rstrip("/")
-    email = args.email or os.environ.get("YAPIT_EMAIL", "")
-    password = args.password or os.environ.get("YAPIT_PASSWORD", "")
+@app.command(name="fetch")
+def cmd_fetch(args: FetchArgs) -> None:
+    """Fetch clean markdown from a URL, file, UUID, or stdin."""
+    base_url, email, password = _resolve_auth(args.email, args.password, args.base_url)
 
     input_type, value = resolve_input(args.input)
     token: str | None = None
-
-    doc_id: str
+    doc_id: str = ""
     title: str | None = None
     source_url: str | None = None
 
@@ -523,3 +523,99 @@ def main() -> None:
             md = fetch_markdown(base_url, doc_id, annotated=True, token=token)
         frontmatter = _yaml_frontmatter(title, source_url)
         print(frontmatter + md, end="" if md.endswith("\n") else "\n")
+
+
+@dataclass
+class ListArgs:
+    """List your documents with titles and URLs.
+
+    JSON schema (--json):
+
+        [{"id": "uuid", "title": "str|null", "url": "str", "created": "iso8601", "public": bool}]
+
+    Examples:
+
+        yapit list
+        yapit list --json | jq '.[] | select(.title | test("arxiv"; "i"))'
+        yapit list --limit 200
+    """
+
+    json: bool = False
+    """Emit JSON to stdout."""
+
+    limit: int = 50
+    """Max documents to fetch (0 = all)."""
+
+    base_url: str = ""
+    """Yapit instance URL. Default: https://yapit.md. Env: YAPIT_BASE_URL."""
+
+    email: str = ""
+    """Auth email. Env: YAPIT_EMAIL."""
+
+    password: str = ""
+    """Auth password. Env: YAPIT_PASSWORD."""
+
+
+@app.command(name="list")
+def cmd_list(args: ListArgs) -> None:
+    """List your documents with titles and URLs."""
+    base_url, email, password = _resolve_auth(args.email, args.password, args.base_url)
+    token = _require_auth(email, password, base_url)
+
+    docs: list[dict] = []
+    offset = 0
+    page_size = min(args.limit, 100) if args.limit > 0 else 100
+
+    while True:
+        resp = httpx.get(
+            f"{base_url}/api/v1/documents",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"offset": offset, "limit": page_size},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        page = resp.json()
+        if not page:
+            break
+        docs.extend(page)
+        if len(page) < page_size:
+            break
+        if args.limit > 0 and len(docs) >= args.limit:
+            docs = docs[: args.limit]
+            break
+        offset += len(page)
+
+    rows = [
+        {
+            "id": d["id"],
+            "title": d["title"],
+            "url": f"{base_url}/listen/{d['id']}",
+            "created": d["created"],
+            "public": d["is_public"],
+        }
+        for d in docs
+    ]
+
+    if args.json:
+        print(json_mod.dumps(rows, indent=2))
+        return
+
+    if not rows:
+        _err("No documents found.")
+        return
+
+    max_title = max(len(r["title"] or "(untitled)") for r in rows)
+    max_title = min(max_title, 60)
+    for r in rows:
+        title = (r["title"] or "(untitled)")[:60]
+        print(f"{title:<{max_title}}  {r['url']}")
+
+
+def main() -> None:
+    if "--version" in sys.argv or "-V" in sys.argv:
+        print(f"yapit {pkg_version('yapit')}")
+        sys.exit(0)
+
+    app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))
+
+
