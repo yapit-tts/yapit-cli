@@ -51,6 +51,23 @@ def _die(msg: str) -> None:
     sys.exit(1)
 
 
+def _raise_for_status(resp: httpx.Response) -> None:
+    """Like resp.raise_for_status(), but prints the server's error detail."""
+    if resp.is_success:
+        return
+    detail = None
+    try:
+        body = resp.json()
+        detail = body.get("detail") if isinstance(body, dict) else None
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("detail")
+    except Exception:
+        pass
+    if detail:
+        _die(detail)
+    resp.raise_for_status()
+
+
 # --- Auth ---
 
 
@@ -77,7 +94,7 @@ def authenticate(base_url: str, email: str, password: str) -> str:
     )
     if resp.status_code == 400:
         _die("authentication failed — check email/password")
-    resp.raise_for_status()
+    _raise_for_status(resp)
     return resp.json()["access_token"]
 
 
@@ -122,7 +139,7 @@ def resolve_input(url_or_id: str) -> tuple[Literal["uuid", "url", "file", "text"
 def create_from_url(client: httpx.Client, url: str, ai: bool) -> tuple[str, str | None]:
     """Create a document from an external URL. Returns (doc_id, title)."""
     resp = client.post("/v1/documents/prepare", json={"url": url}, timeout=30)
-    resp.raise_for_status()
+    _raise_for_status(resp)
     prep = resp.json()
 
     doc_hash = prep["hash"]
@@ -134,7 +151,7 @@ def create_from_url(client: httpx.Client, url: str, ai: bool) -> tuple[str, str 
 
     if endpoint == "website":
         resp = client.post("/v1/documents/website", json={"hash": doc_hash}, timeout=60)
-        resp.raise_for_status()
+        _raise_for_status(resp)
         data = resp.json()
         return data["id"], data.get("title") or title
 
@@ -144,7 +161,7 @@ def create_from_url(client: httpx.Client, url: str, ai: bool) -> tuple[str, str 
             json={"hash": doc_hash, "ai_transform": ai, "batch_mode": False},
             timeout=60,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
         if resp.status_code == 201:
             data = resp.json()
@@ -171,7 +188,7 @@ def create_from_file(client: httpx.Client, file_path: str, ai: bool) -> tuple[st
             files={"file": (path.name, f, content_type)},
             timeout=60,
         )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     prep = resp.json()
 
     doc_hash = prep["hash"]
@@ -187,7 +204,7 @@ def create_from_file(client: httpx.Client, file_path: str, ai: bool) -> tuple[st
             json={"hash": doc_hash, "ai_transform": ai, "batch_mode": False},
             timeout=60,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
         if resp.status_code == 201:
             data = resp.json()
@@ -213,7 +230,7 @@ def _create_text(client: httpx.Client, content: str, title: str | None = None) -
         json={"content": content, "title": title},
         timeout=30,
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     data = resp.json()
     return data["id"], data.get("title") or title
 
@@ -259,7 +276,7 @@ def _poll_extraction(
             },
             timeout=15,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         status = resp.json()
 
         completed = len(status.get("completed_pages", []))
@@ -296,7 +313,7 @@ def fetch_markdown(base_url: str, doc_id: str, annotated: bool, token: str | Non
     if resp.status_code == 404:
         hint = "" if token else " (private doc? set YAPIT_EMAIL/YAPIT_PASSWORD)"
         _die(f"document {doc_id} not found{hint}")
-    resp.raise_for_status()
+    _raise_for_status(resp)
     raise AssertionError  # unreachable
 
 
@@ -573,7 +590,7 @@ def cmd_list(args: ListArgs) -> None:
             params={"offset": offset, "limit": page_size},
             timeout=15,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         page = resp.json()
         if not page:
             break
