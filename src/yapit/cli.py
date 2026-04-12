@@ -38,8 +38,27 @@ _STACK_CLIENT_KEY = "pck_m04c3bgjsmstpk4khbhtma5161b694zcrk94v6dcavpbr"
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 _YAPIT_LISTEN_RE = re.compile(r"yapit\.md/listen/([0-9a-f-]{36})", re.IGNORECASE)
 _IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+_PAGE_RANGE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
 
 app = SubcommandApp()
+
+
+def _parse_pages(spec: str) -> list[int]:
+    """Parse a human-friendly page spec like '1-5,8,12' into 0-indexed page indices."""
+    indices: list[int] = []
+    for part in spec.split(","):
+        part = part.strip()
+        m = _PAGE_RANGE_RE.match(part)
+        if not m:
+            _die(f"invalid page spec: {part!r} (expected e.g. '1-5,8,12')")
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else start
+        if start < 1:
+            _die("page numbers start at 1")
+        if end < start:
+            _die(f"invalid page range: {start}-{end}")
+        indices.extend(range(start - 1, end))
+    return sorted(set(indices))
 
 
 def _err(msg: str) -> None:
@@ -136,7 +155,9 @@ def resolve_input(url_or_id: str) -> tuple[Literal["uuid", "url", "file", "text"
 # --- Document creation ---
 
 
-def create_from_url(client: httpx.Client, url: str, ai: bool) -> tuple[str, str | None]:
+def create_from_url(
+    client: httpx.Client, url: str, ai: bool, pages: list[int] | None = None,
+) -> tuple[str, str | None]:
     """Create a document from an external URL. Returns (doc_id, title)."""
     resp = client.post("/v1/documents/prepare", json={"url": url}, timeout=30)
     _raise_for_status(resp)
@@ -150,17 +171,18 @@ def create_from_url(client: httpx.Client, url: str, ai: bool) -> tuple[str, str 
     _err(f"Creating document from {endpoint}...")
 
     if endpoint == "website":
+        if pages:
+            _err("warning: --pages ignored for website URLs")
         resp = client.post("/v1/documents/website", json={"hash": doc_hash}, timeout=60)
         _raise_for_status(resp)
         data = resp.json()
         return data["id"], data.get("title") or title
 
     if endpoint == "document":
-        resp = client.post(
-            "/v1/documents/document",
-            json={"hash": doc_hash, "ai_transform": ai, "batch_mode": False},
-            timeout=60,
-        )
+        body: dict = {"hash": doc_hash, "ai_transform": ai, "batch_mode": False}
+        if pages is not None:
+            body["pages"] = pages
+        resp = client.post("/v1/documents/document", json=body, timeout=60)
         _raise_for_status(resp)
 
         if resp.status_code == 201:
@@ -168,15 +190,18 @@ def create_from_url(client: httpx.Client, url: str, ai: bool) -> tuple[str, str 
             return data["id"], data.get("title") or title
 
         extraction = resp.json()
+        poll_pages = pages if pages is not None else list(range(extraction["total_pages"]))
         return _poll_extraction(
-            client, extraction.get("extraction_id"), content_hash, ai, list(range(extraction["total_pages"])), title
+            client, extraction.get("extraction_id"), content_hash, ai, poll_pages, title
         )
 
     _die(f"unexpected endpoint type: {endpoint}")
     raise AssertionError
 
 
-def create_from_file(client: httpx.Client, file_path: str, ai: bool) -> tuple[str, str | None]:
+def create_from_file(
+    client: httpx.Client, file_path: str, ai: bool, pages: list[int] | None = None,
+) -> tuple[str, str | None]:
     """Create a document from a local file. Returns (doc_id, title)."""
     path = Path(file_path)
     content_type = _guess_content_type(path)
@@ -199,11 +224,10 @@ def create_from_file(client: httpx.Client, file_path: str, ai: bool) -> tuple[st
     _err(f"Creating document from {endpoint}...")
 
     if endpoint == "document":
-        resp = client.post(
-            "/v1/documents/document",
-            json={"hash": doc_hash, "ai_transform": ai, "batch_mode": False},
-            timeout=60,
-        )
+        body: dict = {"hash": doc_hash, "ai_transform": ai, "batch_mode": False}
+        if pages is not None:
+            body["pages"] = pages
+        resp = client.post("/v1/documents/document", json=body, timeout=60)
         _raise_for_status(resp)
 
         if resp.status_code == 201:
@@ -211,17 +235,22 @@ def create_from_file(client: httpx.Client, file_path: str, ai: bool) -> tuple[st
             return data["id"], data.get("title") or title
 
         extraction = resp.json()
+        poll_pages = pages if pages is not None else list(range(extraction["total_pages"]))
         return _poll_extraction(
-            client, extraction.get("extraction_id"), content_hash, ai, list(range(extraction["total_pages"])), title
+            client, extraction.get("extraction_id"), content_hash, ai, poll_pages, title
         )
 
     if endpoint == "website":
+        if pages:
+            _err("warning: --pages ignored for website files")
         resp = client.post("/v1/documents/website", json={"hash": doc_hash}, timeout=60)
         _raise_for_status(resp)
         data = resp.json()
         return data["id"], data.get("title") or title
 
     if endpoint == "text":
+        if pages:
+            _err("warning: --pages ignored for text files")
         content = path.read_text(encoding="utf-8")
         return _create_text(client, content, title=path.stem)
 
@@ -479,6 +508,9 @@ class FetchArgs:
     tts: bool = True
     """With -o: save TTS.md (annotated version). Use --no-tts to skip."""
 
+    pages: Annotated[str | None, tyro.conf.arg(aliases=["-p"])] = None
+    """Pages to extract from PDFs (1-indexed, inclusive). Single: '5'. Range: '1-5'. List: '1,3,7-10'. Default: all."""
+
     ai: bool = False
     """Use AI extraction for PDFs (uses quota)."""
 
@@ -498,12 +530,15 @@ def cmd_fetch(args: FetchArgs) -> None:
     base_url, email, password = _resolve_auth(args.email, args.password, args.base_url)
 
     input_type, value = resolve_input(args.input)
+    page_indices = _parse_pages(args.pages) if args.pages else None
     token: str | None = None
     doc_id: str = ""
     title: str | None = None
     source_url: str | None = None
 
     if input_type == "uuid":
+        if page_indices:
+            _err("warning: --pages ignored when fetching an existing document")
         doc_id = value
         if email and password:
             token = authenticate(base_url, email, password)
@@ -511,17 +546,19 @@ def cmd_fetch(args: FetchArgs) -> None:
     elif input_type == "url":
         token = _require_auth(email, password, base_url)
         client = httpx.Client(base_url=f"{base_url}/api", headers={"Authorization": f"Bearer {token}"}, timeout=30)
-        doc_id, title = create_from_url(client, value, ai=args.ai)
+        doc_id, title = create_from_url(client, value, ai=args.ai, pages=page_indices)
         source_url = value
         _err(f"Document created: {base_url}/listen/{doc_id}")
 
     elif input_type == "file":
         token = _require_auth(email, password, base_url)
         client = httpx.Client(base_url=f"{base_url}/api", headers={"Authorization": f"Bearer {token}"}, timeout=30)
-        doc_id, title = create_from_file(client, value, ai=args.ai)
+        doc_id, title = create_from_file(client, value, ai=args.ai, pages=page_indices)
         _err(f"Document created: {base_url}/listen/{doc_id}")
 
     elif input_type == "text":
+        if page_indices:
+            _err("warning: --pages ignored for text input")
         token = _require_auth(email, password, base_url)
         client = httpx.Client(base_url=f"{base_url}/api", headers={"Authorization": f"Bearer {token}"}, timeout=30)
         doc_id, title = _create_text(client, value)
