@@ -87,6 +87,25 @@ def _raise_for_status(resp: httpx.Response) -> None:
     resp.raise_for_status()
 
 
+_MAX_RETRIES = 5
+_RETRY_BASE_DELAY = 7.0
+
+
+def _retry_request(method: Callable[..., httpx.Response], *args: object, **kwargs: object) -> httpx.Response:
+    """Call an httpx method, retrying on 429 with exponential backoff."""
+    delay = _RETRY_BASE_DELAY
+    for attempt in range(_MAX_RETRIES + 1):
+        resp = method(*args, **kwargs)
+        if resp.status_code != 429:
+            return resp
+        if attempt == _MAX_RETRIES:
+            return resp
+        _err(f"rate limited, retrying in {delay:.0f}s...")
+        time.sleep(delay)
+        delay = min(delay * 1.5, 60)
+    return resp  # unreachable
+
+
 # --- Auth ---
 
 
@@ -159,7 +178,7 @@ def create_from_url(
     client: httpx.Client, url: str, ai: bool, pages: list[int] | None = None,
 ) -> tuple[str, str | None]:
     """Create a document from an external URL. Returns (doc_id, title)."""
-    resp = client.post("/v1/documents/prepare", json={"url": url}, timeout=30)
+    resp = _retry_request(client.post, "/v1/documents/prepare", json={"url": url}, timeout=30)
     _raise_for_status(resp)
     prep = resp.json()
 
@@ -173,7 +192,7 @@ def create_from_url(
     if endpoint == "website":
         if pages:
             _err("warning: --pages ignored for website URLs")
-        resp = client.post("/v1/documents/website", json={"hash": doc_hash}, timeout=60)
+        resp = _retry_request(client.post, "/v1/documents/website", json={"hash": doc_hash}, timeout=60)
         _raise_for_status(resp)
         data = resp.json()
         return data["id"], data.get("title") or title
@@ -182,7 +201,7 @@ def create_from_url(
         body: dict = {"hash": doc_hash, "ai_transform": ai, "batch_mode": False}
         if pages is not None:
             body["pages"] = pages
-        resp = client.post("/v1/documents/document", json=body, timeout=60)
+        resp = _retry_request(client.post, "/v1/documents/document", json=body, timeout=60)
         _raise_for_status(resp)
 
         if resp.status_code == 201:
@@ -207,12 +226,13 @@ def create_from_file(
     content_type = _guess_content_type(path)
 
     _err(f"Uploading {path.name}...")
-    with path.open("rb") as f:
-        resp = client.post(
-            "/v1/documents/prepare/upload",
-            files={"file": (path.name, f, content_type)},
-            timeout=60,
-        )
+    file_content = path.read_bytes()
+    resp = _retry_request(
+        client.post,
+        "/v1/documents/prepare/upload",
+        files={"file": (path.name, file_content, content_type)},
+        timeout=60,
+    )
     _raise_for_status(resp)
     prep = resp.json()
 
@@ -227,7 +247,7 @@ def create_from_file(
         body: dict = {"hash": doc_hash, "ai_transform": ai, "batch_mode": False}
         if pages is not None:
             body["pages"] = pages
-        resp = client.post("/v1/documents/document", json=body, timeout=60)
+        resp = _retry_request(client.post, "/v1/documents/document", json=body, timeout=60)
         _raise_for_status(resp)
 
         if resp.status_code == 201:
@@ -243,7 +263,7 @@ def create_from_file(
     if endpoint == "website":
         if pages:
             _err("warning: --pages ignored for website files")
-        resp = client.post("/v1/documents/website", json={"hash": doc_hash}, timeout=60)
+        resp = _retry_request(client.post, "/v1/documents/website", json={"hash": doc_hash}, timeout=60)
         _raise_for_status(resp)
         data = resp.json()
         return data["id"], data.get("title") or title
@@ -260,7 +280,8 @@ def create_from_file(
 
 def _create_text(client: httpx.Client, content: str, title: str | None = None) -> tuple[str, str | None]:
     """Create a document from plain text/markdown. Returns (doc_id, title)."""
-    resp = client.post(
+    resp = _retry_request(
+        client.post,
         "/v1/documents/text",
         json={"content": content, "title": title},
         timeout=30,
@@ -301,7 +322,8 @@ def _poll_extraction(
     last_completed = -1
 
     while True:
-        resp = client.post(
+        resp = _retry_request(
+            client.post,
             "/v1/documents/extraction/status",
             json={
                 "extraction_id": extraction_id,
