@@ -215,6 +215,12 @@ def create_from_file(client: httpx.Client, file_path: str, ai: bool) -> tuple[st
             client, extraction.get("extraction_id"), content_hash, ai, list(range(extraction["total_pages"])), title
         )
 
+    if endpoint == "website":
+        resp = client.post("/v1/documents/website", json={"hash": doc_hash}, timeout=60)
+        _raise_for_status(resp)
+        data = resp.json()
+        return data["id"], data.get("title") or title
+
     if endpoint == "text":
         content = path.read_text(encoding="utf-8")
         return _create_text(client, content, title=path.stem)
@@ -410,9 +416,10 @@ def save_to_directory(
     output_dir: Path,
     source_url: str | None = None,
     download_images: bool = True,
+    name: str | None = None,
 ) -> Path:
     """Save markdown, annotated version, and images to a directory. Returns the path."""
-    slug = _slugify(title or "untitled")
+    slug = _slugify(name or title or "untitled")
     doc_dir = output_dir / slug
 
     if doc_dir.exists():
@@ -462,6 +469,9 @@ class FetchArgs:
 
     output_dir: Annotated[str | None, tyro.conf.arg(aliases=["-o"])] = None
     """Save markdown, TTS annotations, and images to <output-dir>/<slug>/."""
+
+    name: Annotated[str | None, tyro.conf.arg(aliases=["-n"])] = None
+    """With -o: override the directory and file name (default: slugified title)."""
 
     images: bool = True
     """With -o: download images. Use --no-images to skip."""
@@ -532,7 +542,7 @@ def cmd_fetch(args: FetchArgs) -> None:
         annotated_md = None if not args.tts else fetch_markdown(base_url, doc_id, annotated=True, token=token)
         doc_dir = save_to_directory(
             md, annotated_md, title, base_url, Path(args.output_dir),
-            source_url=source_url, download_images=args.images,
+            source_url=source_url, download_images=args.images, name=args.name,
         )
         print(doc_dir)
     else:
