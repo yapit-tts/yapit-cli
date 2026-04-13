@@ -392,7 +392,7 @@ def fetch_document_metadata(base_url: str, doc_id: str, token: str | None) -> tu
 
 def _slugify(title: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", title).strip("-").lower()
-    return slug[:100] or "untitled"
+    return slug[:250] or "untitled"
 
 
 def _make_image_downloader(slug: str, base_url: str, doc_dir: Path) -> Callable[[str], str]:
