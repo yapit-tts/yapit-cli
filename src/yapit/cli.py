@@ -4,12 +4,18 @@ Auth: set YAPIT_EMAIL and YAPIT_PASSWORD (or --email/--password).
 Shared documents can be fetched without auth. Creating documents
 or accessing private docs requires a yapit.md account.
 
+Self-hosted instances: point at your server with YAPIT_BASE_URL. If the
+server runs with AUTH_ENABLED=false, no credentials are needed.
+
 Examples:
 
     yapit fetch https://example.com/article
     yapit fetch paper.pdf --ai -o .
     yapit list
     yapit list --json | jq '.[].title'
+
+    # Self-hosted
+    YAPIT_BASE_URL=http://localhost:8000 yapit fetch paper.pdf
 """
 
 from __future__ import annotations
@@ -74,6 +80,12 @@ def _raise_for_status(resp: httpx.Response) -> None:
     """Like resp.raise_for_status(), but prints the server's error detail."""
     if resp.is_success:
         return
+    if resp.status_code == 401:
+        _die(
+            "server rejected request (401 unauthorized) — "
+            "for yapit.md or auth-enabled instances, set YAPIT_EMAIL and YAPIT_PASSWORD; "
+            "for self-hosted instances, start the server with AUTH_ENABLED=false"
+        )
     detail = None
     try:
         body = resp.json()
@@ -130,16 +142,21 @@ def authenticate(base_url: str, email: str, password: str) -> str:
         json={"email": email, "password": password},
         timeout=15,
     )
-    if resp.status_code == 400:
+    if resp.status_code in (400, 401):
         _die("authentication failed — check email/password")
     _raise_for_status(resp)
     return resp.json()["access_token"]
 
 
-def _require_auth(email: str, password: str, base_url: str) -> str:
+def _maybe_auth(email: str, password: str, base_url: str) -> str | None:
+    """Authenticate if creds are provided. Returns None for selfhost / public-doc flows."""
     if not email or not password:
-        _die("authentication required — set YAPIT_EMAIL and YAPIT_PASSWORD")
+        return None
     return authenticate(base_url, email, password)
+
+
+def _auth_headers(token: str | None) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 # --- Input resolution ---
@@ -566,23 +583,23 @@ def cmd_fetch(args: FetchArgs) -> None:
             token = authenticate(base_url, email, password)
 
     elif input_type == "url":
-        token = _require_auth(email, password, base_url)
-        client = httpx.Client(base_url=f"{base_url}/api", headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        token = _maybe_auth(email, password, base_url)
+        client = httpx.Client(base_url=f"{base_url}/api", headers=_auth_headers(token), timeout=30)
         doc_id, title = create_from_url(client, value, ai=args.ai, pages=page_indices)
         source_url = value
         _err(f"Document created: {base_url}/listen/{doc_id}")
 
     elif input_type == "file":
-        token = _require_auth(email, password, base_url)
-        client = httpx.Client(base_url=f"{base_url}/api", headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        token = _maybe_auth(email, password, base_url)
+        client = httpx.Client(base_url=f"{base_url}/api", headers=_auth_headers(token), timeout=30)
         doc_id, title = create_from_file(client, value, ai=args.ai, pages=page_indices)
         _err(f"Document created: {base_url}/listen/{doc_id}")
 
     elif input_type == "text":
         if page_indices:
             _err("warning: --pages ignored for text input")
-        token = _require_auth(email, password, base_url)
-        client = httpx.Client(base_url=f"{base_url}/api", headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        token = _maybe_auth(email, password, base_url)
+        client = httpx.Client(base_url=f"{base_url}/api", headers=_auth_headers(token), timeout=30)
         doc_id, title = _create_text(client, value)
         _err(f"Document created: {base_url}/listen/{doc_id}")
 
@@ -646,7 +663,7 @@ class ListArgs:
 def cmd_list(args: ListArgs) -> None:
     """List your documents with titles and URLs."""
     base_url, email, password = _resolve_auth(args.email, args.password, args.base_url)
-    token = _require_auth(email, password, base_url)
+    token = _maybe_auth(email, password, base_url)
 
     docs: list[dict] = []
     offset = 0
@@ -655,7 +672,7 @@ def cmd_list(args: ListArgs) -> None:
     while True:
         resp = httpx.get(
             f"{base_url}/api/v1/documents",
-            headers={"Authorization": f"Bearer {token}"},
+            headers=_auth_headers(token),
             params={"offset": offset, "limit": page_size},
             timeout=15,
         )

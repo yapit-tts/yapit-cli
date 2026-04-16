@@ -44,6 +44,17 @@ export YAPIT_PASSWORD=...
 
 Fetching shared documents works without auth.
 
+## Self-hosting
+
+Point the CLI at your own instance with `YAPIT_BASE_URL`:
+
+```bash
+export YAPIT_BASE_URL=http://localhost:8000
+yapit fetch paper.pdf
+```
+
+If your server runs with `AUTH_ENABLED=false` (the `make self-host` default), no credentials are needed. If auth is enabled on your instance, set `YAPIT_EMAIL` / `YAPIT_PASSWORD` as above.
+
 ## Save to directory (`-o`)
 
 `-o <dir>` saves markdown, TTS annotations, and images:
