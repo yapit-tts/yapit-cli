@@ -30,7 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from importlib.metadata import version as pkg_version
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, NoReturn
 from urllib.parse import urlparse
 
 import httpx
@@ -71,7 +71,7 @@ def _err(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-def _die(msg: str) -> None:
+def _die(msg: str) -> NoReturn:
     _err(f"error: {msg}")
     sys.exit(1)
 
@@ -104,15 +104,21 @@ _RETRY_BASE_DELAY = 7.0
 
 
 def _retry_request(method: Callable[..., httpx.Response], *args: object, **kwargs: object) -> httpx.Response:
-    """Call an httpx method, retrying on 429 with exponential backoff."""
+    """Call an httpx method, retrying on 429 and transient transport errors with exponential backoff."""
     delay = _RETRY_BASE_DELAY
     for attempt in range(_MAX_RETRIES + 1):
-        resp = method(*args, **kwargs)
-        if resp.status_code != 429:
-            return resp
-        if attempt == _MAX_RETRIES:
-            return resp
-        _err(f"rate limited, retrying in {delay:.0f}s...")
+        try:
+            resp = method(*args, **kwargs)
+        except httpx.TransportError as exc:
+            if attempt == _MAX_RETRIES:
+                raise
+            _err(f"transport error ({type(exc).__name__}: {exc}), retrying in {delay:.0f}s...")
+        else:
+            if resp.status_code != 429:
+                return resp
+            if attempt == _MAX_RETRIES:
+                return resp
+            _err(f"rate limited, retrying in {delay:.0f}s...")
         time.sleep(delay)
         delay = min(delay * 1.5, 60)
     return resp  # unreachable
