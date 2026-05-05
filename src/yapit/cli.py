@@ -194,14 +194,43 @@ def resolve_input(url_or_id: str) -> tuple[Literal["uuid", "url", "file", "text"
     raise AssertionError
 
 
+# --- Prompt resolution ---
+
+
+def _resolve_prompt(literal: str | None, file: str | None, input_is_stdin: bool) -> str | None:
+    """Resolve --prompt / --prompt-file into a string, or None if neither set."""
+    if literal is not None and file is not None:
+        _die("--prompt and --prompt-file are mutually exclusive")
+    if literal is not None:
+        return literal
+    if file is None:
+        return None
+    if file == "-":
+        if input_is_stdin:
+            _die("--prompt-file - cannot be used when input is also '-' (stdin already consumed)")
+        return sys.stdin.read()
+    try:
+        return Path(file).read_text(encoding="utf-8")
+    except OSError as e:
+        _die(f"failed to read --prompt-file {file!r}: {e}")
+    raise AssertionError  # unreachable
+
+
 # --- Document creation ---
 
 
 def create_from_url(
-    client: httpx.Client, url: str, ai: bool, pages: list[int] | None = None,
+    client: httpx.Client,
+    url: str,
+    ai: bool,
+    pages: list[int] | None = None,
+    extraction_prompt: str | None = None,
 ) -> tuple[str, str | None]:
     """Create a document from an external URL. Returns (doc_id, title)."""
-    resp = _retry_request(client.post, "/v1/documents/prepare", json={"url": url}, timeout=30)
+    prepare_body: dict = {"url": url}
+    if extraction_prompt is not None:
+        prepare_body["extraction_prompt"] = extraction_prompt
+    resp = _retry_request(client.post, "/v1/documents/prepare", json=prepare_body, timeout=30)
     _raise_for_status(resp)
     prep = resp.json()
 
@@ -215,6 +244,8 @@ def create_from_url(
     if endpoint == "website":
         if pages:
             _err("warning: --pages ignored for website URLs")
+        if extraction_prompt:
+            _err("warning: --prompt/--prompt-file ignored for website URLs")
         resp = _retry_request(client.post, "/v1/documents/website", json={"hash": doc_hash}, timeout=60)
         _raise_for_status(resp)
         data = resp.json()
@@ -224,6 +255,8 @@ def create_from_url(
         body: dict = {"hash": doc_hash, "ai_transform": ai, "batch_mode": False}
         if pages is not None:
             body["pages"] = pages
+        if extraction_prompt is not None:
+            body["extraction_prompt"] = extraction_prompt
         resp = _retry_request(client.post, "/v1/documents/document", json=body, timeout=60)
         _raise_for_status(resp)
 
@@ -233,16 +266,18 @@ def create_from_url(
 
         extraction = resp.json()
         poll_pages = pages if pages is not None else list(range(extraction["total_pages"]))
-        return _poll_extraction(
-            client, extraction.get("extraction_id"), content_hash, ai, poll_pages, title
-        )
+        return _poll_extraction(client, extraction.get("extraction_id"), content_hash, ai, poll_pages, title)
 
     _die(f"unexpected endpoint type: {endpoint}")
     raise AssertionError
 
 
 def create_from_file(
-    client: httpx.Client, file_path: str, ai: bool, pages: list[int] | None = None,
+    client: httpx.Client,
+    file_path: str,
+    ai: bool,
+    pages: list[int] | None = None,
+    extraction_prompt: str | None = None,
 ) -> tuple[str, str | None]:
     """Create a document from a local file. Returns (doc_id, title)."""
     path = Path(file_path)
@@ -250,10 +285,12 @@ def create_from_file(
 
     _err(f"Uploading {path.name}...")
     file_content = path.read_bytes()
+    upload_data = {"extraction_prompt": extraction_prompt} if extraction_prompt is not None else None
     resp = _retry_request(
         client.post,
         "/v1/documents/prepare/upload",
         files={"file": (path.name, file_content, content_type)},
+        data=upload_data,
         timeout=60,
     )
     _raise_for_status(resp)
@@ -270,6 +307,8 @@ def create_from_file(
         body: dict = {"hash": doc_hash, "ai_transform": ai, "batch_mode": False}
         if pages is not None:
             body["pages"] = pages
+        if extraction_prompt is not None:
+            body["extraction_prompt"] = extraction_prompt
         resp = _retry_request(client.post, "/v1/documents/document", json=body, timeout=60)
         _raise_for_status(resp)
 
@@ -279,13 +318,13 @@ def create_from_file(
 
         extraction = resp.json()
         poll_pages = pages if pages is not None else list(range(extraction["total_pages"]))
-        return _poll_extraction(
-            client, extraction.get("extraction_id"), content_hash, ai, poll_pages, title
-        )
+        return _poll_extraction(client, extraction.get("extraction_id"), content_hash, ai, poll_pages, title)
 
     if endpoint == "website":
         if pages:
             _err("warning: --pages ignored for website files")
+        if extraction_prompt:
+            _err("warning: --prompt/--prompt-file ignored for website files")
         resp = _retry_request(client.post, "/v1/documents/website", json={"hash": doc_hash}, timeout=60)
         _raise_for_status(resp)
         data = resp.json()
@@ -294,6 +333,8 @@ def create_from_file(
     if endpoint == "text":
         if pages:
             _err("warning: --pages ignored for text files")
+        if extraction_prompt:
+            _err("warning: --prompt/--prompt-file ignored for text files")
         content = path.read_text(encoding="utf-8")
         return _create_text(client, content, title=path.stem)
 
@@ -531,6 +572,8 @@ class FetchArgs:
 
         yapit fetch https://example.com/article
         yapit fetch paper.pdf --ai -o .
+        yapit fetch paper.pdf --ai --prompt "Extract only the abstract."
+        yapit fetch paper.pdf --ai --prompt-file ./my-prompt.txt
         yapit fetch 550e8400-e29b-41d4-a716-446655440000 --annotated
         echo "hello world" | yapit fetch -
     """
@@ -559,6 +602,12 @@ class FetchArgs:
     ai: bool = False
     """Use AI extraction for PDFs (uses quota)."""
 
+    prompt: Annotated[str | None, tyro.conf.arg(aliases=["-P"])] = None
+    """Custom extraction prompt for AI extraction. Requires --ai. Mutually exclusive with --prompt-file."""
+
+    prompt_file: str | None = None
+    """Path to a file containing the extraction prompt. Use '-' for stdin. Requires --ai."""
+
     base_url: str = ""
     """Yapit instance URL. Default: https://yapit.md. Env: YAPIT_BASE_URL."""
 
@@ -574,6 +623,11 @@ def cmd_fetch(args: FetchArgs) -> None:
     """Fetch clean markdown from a URL, file, UUID, or stdin."""
     base_url, email, password = _resolve_auth(args.email, args.password, args.base_url)
 
+    input_is_stdin = args.input == "-"
+    extraction_prompt = _resolve_prompt(args.prompt, args.prompt_file, input_is_stdin)
+    if extraction_prompt is not None and not args.ai:
+        _die("--prompt/--prompt-file requires --ai")
+
     input_type, value = resolve_input(args.input)
     page_indices = _parse_pages(args.pages) if args.pages else None
     token: str | None = None
@@ -584,6 +638,8 @@ def cmd_fetch(args: FetchArgs) -> None:
     if input_type == "uuid":
         if page_indices:
             _err("warning: --pages ignored when fetching an existing document")
+        if extraction_prompt:
+            _err("warning: --prompt/--prompt-file ignored when fetching an existing document")
         doc_id = value
         if email and password:
             token = authenticate(base_url, email, password)
@@ -591,19 +647,33 @@ def cmd_fetch(args: FetchArgs) -> None:
     elif input_type == "url":
         token = _maybe_auth(email, password, base_url)
         client = httpx.Client(base_url=f"{base_url}/api", headers=_auth_headers(token), timeout=30)
-        doc_id, title = create_from_url(client, value, ai=args.ai, pages=page_indices)
+        doc_id, title = create_from_url(
+            client,
+            value,
+            ai=args.ai,
+            pages=page_indices,
+            extraction_prompt=extraction_prompt,
+        )
         source_url = value
         _err(f"Document created: {base_url}/listen/{doc_id}")
 
     elif input_type == "file":
         token = _maybe_auth(email, password, base_url)
         client = httpx.Client(base_url=f"{base_url}/api", headers=_auth_headers(token), timeout=30)
-        doc_id, title = create_from_file(client, value, ai=args.ai, pages=page_indices)
+        doc_id, title = create_from_file(
+            client,
+            value,
+            ai=args.ai,
+            pages=page_indices,
+            extraction_prompt=extraction_prompt,
+        )
         _err(f"Document created: {base_url}/listen/{doc_id}")
 
     elif input_type == "text":
         if page_indices:
             _err("warning: --pages ignored for text input")
+        if extraction_prompt:
+            _err("warning: --prompt/--prompt-file ignored for text input")
         token = _maybe_auth(email, password, base_url)
         client = httpx.Client(base_url=f"{base_url}/api", headers=_auth_headers(token), timeout=30)
         doc_id, title = _create_text(client, value)
@@ -623,8 +693,14 @@ def cmd_fetch(args: FetchArgs) -> None:
     if args.output_dir is not None:
         annotated_md = None if not args.tts else fetch_markdown(base_url, doc_id, annotated=True, token=token)
         doc_dir = save_to_directory(
-            md, annotated_md, title, base_url, Path(args.output_dir),
-            source_url=source_url, download_images=args.images, name=args.name,
+            md,
+            annotated_md,
+            title,
+            base_url,
+            Path(args.output_dir),
+            source_url=source_url,
+            download_images=args.images,
+            name=args.name,
         )
         print(doc_dir)
     else:
@@ -726,5 +802,3 @@ def main() -> None:
         sys.exit(0)
 
     app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))
-
-
