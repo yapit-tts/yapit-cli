@@ -45,7 +45,7 @@ define bump_version
 	@VERSION=$$(grep 'version = ' pyproject.toml | head -1 | cut -d'"' -f2) && \
 		git add pyproject.toml && \
 		git commit -m "Release v$$VERSION" && \
-		git tag "v$$VERSION"
+		git tag -m "v$$VERSION" "v$$VERSION"
 endef
 
 release-patch: check
