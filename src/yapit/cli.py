@@ -28,6 +28,7 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 from typing import Annotated, Literal, NoReturn
@@ -438,17 +439,23 @@ def fetch_markdown(base_url: str, doc_id: str, annotated: bool, token: str | Non
     raise AssertionError  # unreachable
 
 
-def fetch_document_metadata(base_url: str, doc_id: str, token: str | None) -> tuple[str | None, str | None]:
-    """Fetch document title and source URL from the API."""
+def fetch_document_metadata(base_url: str, doc_id: str, token: str | None) -> tuple[str | None, str | None, str | None]:
+    """Fetch document title, source URL, and capture date from the API.
+
+    The capture date is when the server created the document — i.e. when the
+    source was fetched from its origin, not when this CLI pulled it.
+    """
     url = f"{base_url}/api/v1/documents/{doc_id}"
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     resp = httpx.get(url, headers=headers, timeout=15)
-    if resp.status_code == 200:
-        data = resp.json()
-        title = data.get("title")
-        source_url = (data.get("metadata_dict") or {}).get("url")
-        return title, source_url
-    return None, None
+    if resp.status_code != 200:
+        return None, None, None
+    data = resp.json()
+    title = data.get("title")
+    source_url = (data.get("metadata_dict") or {}).get("url")
+    created = data.get("created")
+    accessed = datetime.fromisoformat(created).astimezone().date().isoformat() if created else None
+    return title, source_url, accessed
 
 
 # --- Save to directory ---
@@ -510,7 +517,7 @@ def _make_image_downloader(slug: str, base_url: str, doc_dir: Path) -> Callable[
     return download_images
 
 
-def _yaml_frontmatter(title: str | None, source_url: str | None) -> str:
+def _yaml_frontmatter(title: str | None, source_url: str | None, accessed: str | None) -> str:
     """Build YAML frontmatter string. Returns empty string if no metadata."""
     fields: list[str] = []
     if title:
@@ -518,6 +525,8 @@ def _yaml_frontmatter(title: str | None, source_url: str | None) -> str:
         fields.append(f'title: "{escaped}"')
     if source_url:
         fields.append(f"source: {source_url}")
+    if accessed:
+        fields.append(f"accessed: {accessed}")
     if not fields:
         return ""
     return "---\n" + "\n".join(fields) + "\n---\n\n"
@@ -530,6 +539,7 @@ def save_to_directory(
     base_url: str,
     output_dir: Path,
     source_url: str | None = None,
+    accessed: str | None = None,
     download_images: bool = True,
     name: str | None = None,
 ) -> Path:
@@ -548,7 +558,7 @@ def save_to_directory(
         if annotated_md:
             annotated_md = dl(annotated_md)
 
-    frontmatter = _yaml_frontmatter(title, source_url)
+    frontmatter = _yaml_frontmatter(title, source_url, accessed)
     (doc_dir / f"{slug}.md").write_text(frontmatter + md, encoding="utf-8")
     if annotated_md:
         (doc_dir / "TTS.md").write_text(annotated_md, encoding="utf-8")
@@ -682,12 +692,11 @@ def cmd_fetch(args: FetchArgs) -> None:
     else:
         raise AssertionError(f"unexpected input type: {input_type}")
 
-    if not title or not source_url:
-        api_title, api_source_url = fetch_document_metadata(base_url, doc_id, token)
-        if not title:
-            title = api_title
-        if not source_url:
-            source_url = api_source_url
+    api_title, api_source_url, accessed = fetch_document_metadata(base_url, doc_id, token)
+    if not title:
+        title = api_title
+    if not source_url:
+        source_url = api_source_url
     md = fetch_markdown(base_url, doc_id, annotated=False, token=token)
 
     if args.output_dir is not None:
@@ -699,6 +708,7 @@ def cmd_fetch(args: FetchArgs) -> None:
             base_url,
             Path(args.output_dir),
             source_url=source_url,
+            accessed=accessed,
             download_images=args.images,
             name=args.name,
         )
@@ -706,7 +716,7 @@ def cmd_fetch(args: FetchArgs) -> None:
     else:
         if args.annotated:
             md = fetch_markdown(base_url, doc_id, annotated=True, token=token)
-        frontmatter = _yaml_frontmatter(title, source_url)
+        frontmatter = _yaml_frontmatter(title, source_url, accessed)
         print(frontmatter + md, end="" if md.endswith("\n") else "\n")
 
 
