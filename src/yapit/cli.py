@@ -279,6 +279,7 @@ def create_from_file(
     ai: bool,
     pages: list[int] | None = None,
     extraction_prompt: str | None = None,
+    source_url: str | None = None,
 ) -> tuple[str, str | None]:
     """Create a document from a local file. Returns (doc_id, title)."""
     path = Path(file_path)
@@ -286,7 +287,8 @@ def create_from_file(
 
     _err(f"Uploading {path.name}...")
     file_content = path.read_bytes()
-    upload_data = {"extraction_prompt": extraction_prompt} if extraction_prompt is not None else None
+    fields = {"extraction_prompt": extraction_prompt, "source_url": source_url}
+    upload_data = {k: v for k, v in fields.items() if v is not None} or None
     resp = _retry_request(
         client.post,
         "/v1/documents/prepare/upload",
@@ -618,6 +620,9 @@ class FetchArgs:
     prompt_file: str | None = None
     """Path to a file containing the extraction prompt. Use '-' for stdin. Requires --ai."""
 
+    source_url: str | None = None
+    """URL a local file was fetched from. Recorded as the document's source, and used to resolve its relative links."""
+
     base_url: str = ""
     """Yapit instance URL. Default: https://yapit.md. Env: YAPIT_BASE_URL."""
 
@@ -639,6 +644,8 @@ def cmd_fetch(args: FetchArgs) -> None:
         _die("--prompt/--prompt-file requires --ai")
 
     input_type, value = resolve_input(args.input)
+    if args.source_url and input_type != "file":
+        _err("warning: --source-url ignored for non-file input")
     page_indices = _parse_pages(args.pages) if args.pages else None
     token: str | None = None
     doc_id: str = ""
@@ -676,6 +683,7 @@ def cmd_fetch(args: FetchArgs) -> None:
             ai=args.ai,
             pages=page_indices,
             extraction_prompt=extraction_prompt,
+            source_url=args.source_url,
         )
         _err(f"Document created: {base_url}/listen/{doc_id}")
 
