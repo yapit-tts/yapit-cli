@@ -35,25 +35,26 @@ echo "hello world" | yapit -
 
 ## Auth
 
-Creating documents or accessing private docs requires a [yapit.md](https://yapit.md) account:
+Creating documents or accessing private docs requires a [yapit.md](https://yapit.md) account and an API token. Create one in your account settings, then:
 
 ```bash
-export YAPIT_EMAIL=you@example.com
-export YAPIT_PASSWORD=...
+export YAPIT_TOKEN=yapit_...
 ```
 
-Fetching shared documents works without auth.
+The CLI sends it as `Authorization: Bearer`. Fetching shared documents works without auth.
 
 ## Self-hosting
 
 Point the CLI at your own instance with `YAPIT_BASE_URL`:
 
 ```bash
-export YAPIT_BASE_URL=http://localhost:8000
+export YAPIT_BASE_URL=http://localhost
 yapit fetch paper.pdf
 ```
 
-If your server runs with `AUTH_ENABLED=false` (the `make self-host` default), no credentials are needed. If auth is enabled on your instance, set `YAPIT_EMAIL` / `YAPIT_PASSWORD` as above.
+`YAPIT_BASE_URL` is the address you open yapit at in the browser; the CLI calls the API under its `/api` path.
+
+If your server runs with `AUTH_ENABLED=false` (the `make self-host` default), no token is needed. If auth is enabled on your instance, set `YAPIT_TOKEN` as above. The self-hosting guide in yapit's [docs/auth.md](https://github.com/yapit-tts/yapit/blob/main/docs/auth.md#multi-user-selfhost) shows how to create a token on the server.
 
 ## Save to directory (`-o`)
 
