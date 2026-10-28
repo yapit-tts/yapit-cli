@@ -80,8 +80,7 @@ def _raise_for_status(resp: httpx.Response) -> None:
     if resp.status_code == 401:
         _die(
             "server rejected request (401 unauthorized) — "
-            "for yapit.md or auth-enabled instances, set YAPIT_TOKEN to an API token from your account settings; "
-            "for self-hosted instances, start the server with AUTH_ENABLED=false"
+            "set YAPIT_TOKEN to an API token for your account on this server"
         )
     detail = None
     try:
