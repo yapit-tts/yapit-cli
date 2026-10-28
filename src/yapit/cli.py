@@ -78,10 +78,12 @@ def _raise_for_status(resp: httpx.Response) -> None:
     if resp.is_success:
         return
     if resp.status_code == 401:
-        _die(
-            "server rejected request (401 unauthorized) — "
-            "set YAPIT_TOKEN to an API token for your account on this server"
-        )
+        if "authorization" in resp.request.headers:
+            _die(
+                "server rejected YAPIT_TOKEN (401 unauthorized): "
+                "it may be revoked, or issued by a server other than YAPIT_BASE_URL"
+            )
+        _die("server requires sign-in (401 unauthorized): set YAPIT_TOKEN to an API token for your account on it")
     detail = None
     try:
         body = resp.json()
