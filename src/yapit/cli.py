@@ -1,11 +1,11 @@
 """Fetch clean markdown from yapit.md documents, URLs, and local files.
 
-Auth: set YAPIT_EMAIL and YAPIT_PASSWORD (or --email/--password).
+Auth: set YAPIT_TOKEN to an API token from your yapit.md account settings.
 Shared documents can be fetched without auth. Creating documents
 or accessing private docs requires a yapit.md account.
 
 Self-hosted instances: point at your server with YAPIT_BASE_URL. If the
-server runs with AUTH_ENABLED=false, no credentials are needed.
+server runs with AUTH_ENABLED=false, no token is needed.
 
 Examples:
 
@@ -15,7 +15,7 @@ Examples:
     yapit list --json | jq '.[].title'
 
     # Self-hosted
-    YAPIT_BASE_URL=http://localhost:8000 yapit fetch paper.pdf
+    YAPIT_BASE_URL=http://localhost yapit fetch paper.pdf
 """
 
 from __future__ import annotations
@@ -37,10 +37,6 @@ from urllib.parse import urlparse
 import httpx
 import tyro
 from tyro.extras import SubcommandApp
-
-# Stack Auth public credentials (baked into the frontend bundle)
-_STACK_PROJECT_ID = "6038930b-72c1-407f-9e38-f1287a4d1ede"
-_STACK_CLIENT_KEY = "pck_m04c3bgjsmstpk4khbhtma5161b694zcrk94v6dcavpbr"
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 _YAPIT_LISTEN_RE = re.compile(r"yapit\.md/listen/([0-9a-f-]{36})", re.IGNORECASE)
@@ -82,11 +78,12 @@ def _raise_for_status(resp: httpx.Response) -> None:
     if resp.is_success:
         return
     if resp.status_code == 401:
-        _die(
-            "server rejected request (401 unauthorized) — "
-            "for yapit.md or auth-enabled instances, set YAPIT_EMAIL and YAPIT_PASSWORD; "
-            "for self-hosted instances, start the server with AUTH_ENABLED=false"
-        )
+        if "authorization" in resp.request.headers:
+            _die(
+                "server rejected YAPIT_TOKEN (401 unauthorized): "
+                "it may be revoked, or issued by a server other than YAPIT_BASE_URL"
+            )
+        _die("server requires sign-in (401 unauthorized): set YAPIT_TOKEN to an API token for your account on it")
     detail = None
     try:
         body = resp.json()
@@ -128,38 +125,13 @@ def _retry_request(method: Callable[..., httpx.Response], *args: object, **kwarg
 # --- Auth ---
 
 
-def _resolve_auth(email: str, password: str, base_url: str) -> tuple[str, str, str]:
-    """Resolve auth and base_url from args/env, return (base_url, email, password)."""
-    base_url = (base_url or os.environ.get("YAPIT_BASE_URL", "https://yapit.md")).rstrip("/")
-    email = email or os.environ.get("YAPIT_EMAIL", "")
-    password = password or os.environ.get("YAPIT_PASSWORD", "")
-    return base_url, email, password
+def _resolve_base_url(base_url: str) -> str:
+    return (base_url or os.environ.get("YAPIT_BASE_URL", "https://yapit.md")).rstrip("/")
 
 
-def authenticate(base_url: str, email: str, password: str) -> str:
-    """Sign in via Stack Auth and return an access token."""
-    resp = httpx.post(
-        f"{base_url}/auth/api/v1/auth/password/sign-in",
-        headers={
-            "Content-Type": "application/json",
-            "X-Stack-Access-Type": "client",
-            "X-Stack-Project-Id": _STACK_PROJECT_ID,
-            "X-Stack-Publishable-Client-Key": _STACK_CLIENT_KEY,
-        },
-        json={"email": email, "password": password},
-        timeout=15,
-    )
-    if resp.status_code in (400, 401):
-        _die("authentication failed — check email/password")
-    _raise_for_status(resp)
-    return resp.json()["access_token"]
-
-
-def _maybe_auth(email: str, password: str, base_url: str) -> str | None:
-    """Authenticate if creds are provided. Returns None for selfhost / public-doc flows."""
-    if not email or not password:
-        return None
-    return authenticate(base_url, email, password)
+def _token() -> str | None:
+    """The API token from YAPIT_TOKEN, or None for selfhost / public-doc flows."""
+    return os.environ.get("YAPIT_TOKEN") or None
 
 
 def _auth_headers(token: str | None) -> dict[str, str]:
@@ -435,7 +407,7 @@ def fetch_markdown(base_url: str, doc_id: str, annotated: bool, token: str | Non
     if resp.status_code == 200:
         return resp.text
     if resp.status_code == 404:
-        hint = "" if token else " (private doc? set YAPIT_EMAIL/YAPIT_PASSWORD)"
+        hint = "" if token else " (private doc? set YAPIT_TOKEN)"
         _die(f"document {doc_id} not found{hint}")
     _raise_for_status(resp)
     raise AssertionError  # unreachable
@@ -626,17 +598,12 @@ class FetchArgs:
     base_url: str = ""
     """Yapit instance URL. Default: https://yapit.md. Env: YAPIT_BASE_URL."""
 
-    email: str = ""
-    """Auth email. Env: YAPIT_EMAIL."""
-
-    password: str = ""
-    """Auth password. Env: YAPIT_PASSWORD."""
-
 
 @app.command(name="fetch")
 def cmd_fetch(args: FetchArgs) -> None:
     """Fetch clean markdown from a URL, file, UUID, or stdin."""
-    base_url, email, password = _resolve_auth(args.email, args.password, args.base_url)
+    base_url = _resolve_base_url(args.base_url)
+    token = _token()
 
     input_is_stdin = args.input == "-"
     extraction_prompt = _resolve_prompt(args.prompt, args.prompt_file, input_is_stdin)
@@ -647,7 +614,6 @@ def cmd_fetch(args: FetchArgs) -> None:
     if args.source_url and input_type != "file":
         _err("warning: --source-url ignored for non-file input")
     page_indices = _parse_pages(args.pages) if args.pages else None
-    token: str | None = None
     doc_id: str = ""
     title: str | None = None
     source_url: str | None = None
@@ -658,11 +624,8 @@ def cmd_fetch(args: FetchArgs) -> None:
         if extraction_prompt:
             _err("warning: --prompt/--prompt-file ignored when fetching an existing document")
         doc_id = value
-        if email and password:
-            token = authenticate(base_url, email, password)
 
     elif input_type == "url":
-        token = _maybe_auth(email, password, base_url)
         client = httpx.Client(base_url=f"{base_url}/api", headers=_auth_headers(token), timeout=30)
         doc_id, title = create_from_url(
             client,
@@ -675,7 +638,6 @@ def cmd_fetch(args: FetchArgs) -> None:
         _err(f"Document created: {base_url}/listen/{doc_id}")
 
     elif input_type == "file":
-        token = _maybe_auth(email, password, base_url)
         client = httpx.Client(base_url=f"{base_url}/api", headers=_auth_headers(token), timeout=30)
         doc_id, title = create_from_file(
             client,
@@ -692,7 +654,6 @@ def cmd_fetch(args: FetchArgs) -> None:
             _err("warning: --pages ignored for text input")
         if extraction_prompt:
             _err("warning: --prompt/--prompt-file ignored for text input")
-        token = _maybe_auth(email, password, base_url)
         client = httpx.Client(base_url=f"{base_url}/api", headers=_auth_headers(token), timeout=30)
         doc_id, title = _create_text(client, value)
         _err(f"Document created: {base_url}/listen/{doc_id}")
@@ -752,18 +713,12 @@ class ListArgs:
     base_url: str = ""
     """Yapit instance URL. Default: https://yapit.md. Env: YAPIT_BASE_URL."""
 
-    email: str = ""
-    """Auth email. Env: YAPIT_EMAIL."""
-
-    password: str = ""
-    """Auth password. Env: YAPIT_PASSWORD."""
-
 
 @app.command(name="list")
 def cmd_list(args: ListArgs) -> None:
     """List your documents with titles and URLs."""
-    base_url, email, password = _resolve_auth(args.email, args.password, args.base_url)
-    token = _maybe_auth(email, password, base_url)
+    base_url = _resolve_base_url(args.base_url)
+    token = _token()
 
     docs: list[dict] = []
     offset = 0
